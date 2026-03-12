@@ -142,7 +142,7 @@ async function download() {
   });
 }
 
-// ─── Step 2+3: Encode HLS + stream-upload segments as they're created ──
+// ─── Step 2: Create SpaceByte folder ─────────────────────────
 async function createSpaceBytFolder() {
   const folderName = `hls_${FILE_NAME}_${Date.now()}`.slice(0, 200);
   log(`Creating SpaceByte folder: ${folderName}`);
@@ -161,6 +161,7 @@ async function createSpaceBytFolder() {
   return String(folderId);
 }
 
+// ─── Upload helper ───────────────────────────────────────────
 async function uploadOneFile(fileName, folderId) {
   const filePath = path.join(HLS_DIR, fileName);
   const fileSize = fs.statSync(filePath).size;
@@ -170,33 +171,35 @@ async function uploadOneFile(fileName, folderId) {
     : "video/iso.segment";
 
   const form = new FormData();
-  form.append("file", fs.createReadStream(filePath), {
+  const stream = fs.createReadStream(filePath);
+  form.append("file", stream, {
     filename: fileName,
     contentType,
     knownLength: fileSize
   });
   form.append("parentId", String(folderId));
 
-  const resp = await axios.post(`${SB_API}/uploads`, form, {
-    headers: { ...form.getHeaders(), Authorization: `Bearer ${SB_TOKEN}` },
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-    timeout: 300000
-  });
+  try {
+    const resp = await axios.post(`${SB_API}/uploads`, form, {
+      headers: { ...form.getHeaders(), Authorization: `Bearer ${SB_TOKEN}` },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: 300000
+    });
 
-  const id = resp.data?.fileEntry?.id || resp.data?.id || resp.data?.data?.id;
-  if (!id) throw new Error(`Upload ${fileName} failed: no ID returned`);
-  return String(id);
+    const id = resp.data?.fileEntry?.id || resp.data?.id || resp.data?.data?.id;
+    if (!id) throw new Error(`Upload ${fileName} failed: no ID returned`);
+    return String(id);
+  } finally {
+    stream.destroy();
+  }
 }
 
-async function encodeAndStreamUpload() {
-  log("Encoding HLS + streaming upload of segments...");
-  reportStatus("running", "Encoding HLS + uploading segments...", 0);
+// ─── Step 3: Encode HLS ──────────────────────────────────────
+async function encodeHLS() {
+  log("Encoding HLS...");
+  reportStatus("running", "Encoding HLS...", 0);
   fs.mkdirSync(HLS_DIR, { recursive: true });
-
-  // Create SpaceByte folder first
-  const folderId = await createSpaceBytFolder();
-  const fileMap = {};
 
   // Probe video duration
   let duration = 0;
@@ -233,107 +236,23 @@ async function encodeAndStreamUpload() {
     manifestPath
   ];
 
-  // Track segments: uploaded set, upload queue, and active upload promises
-  const uploadedSet = new Set();
-  const uploadQueue = [];
-  const activeUploads = [];
-  let encodingDone = false;
-  let totalSegments = 0;
-  let uploadedCount = 0;
-
-  // Upload worker: processes uploadQueue with PARALLEL_UPLOADS concurrency
-  async function uploadWorker() {
-    while (true) {
-      // Fill active slots
-      while (activeUploads.length < PARALLEL_UPLOADS && uploadQueue.length > 0) {
-        const fileName = uploadQueue.shift();
-        const p = uploadOneFile(fileName, folderId)
-          .then(id => {
-            fileMap[fileName] = id;
-            uploadedCount++;
-            if (uploadedCount % 20 === 0) log(`  Streamed: ${uploadedCount} segments uploaded`);
-          })
-          .catch(err => {
-            log(`  Retry upload: ${fileName} (${err.message.slice(0, 80)})`);
-            return uploadOneFile(fileName, folderId).then(id => {
-              fileMap[fileName] = id;
-              uploadedCount++;
-            });
-          });
-        activeUploads.push(p);
-      }
-
-      if (activeUploads.length > 0) {
-        await Promise.race(activeUploads);
-        // Remove settled promises
-        for (let i = activeUploads.length - 1; i >= 0; i--) {
-          const done = await Promise.race([activeUploads[i].then(() => true), Promise.resolve(false)]);
-          if (done) activeUploads.splice(i, 1);
-        }
-      } else if (encodingDone && uploadQueue.length === 0) {
-        break;
-      } else {
-        // No work yet, wait a bit
-        await new Promise(r => setTimeout(r, 500));
-      }
-    }
-  }
-
-  // File watcher: detect new segments and queue them for upload
-  let knownFiles = new Set();
-  const watchInterval = setInterval(() => {
-    if (!fs.existsSync(HLS_DIR)) return;
-    const files = fs.readdirSync(HLS_DIR);
-    for (const f of files) {
-      if (knownFiles.has(f) || uploadedSet.has(f)) continue;
-      // Skip the manifest — upload it last after encoding completes
-      if (f === "index.m3u8") continue;
-      // For segments: only upload if the next segment exists (meaning this one is complete)
-      // For init.mp4: upload immediately
-      if (f === "init.mp4") {
-        knownFiles.add(f);
-        uploadedSet.add(f);
-        uploadQueue.push(f);
-        log("  init.mp4 ready → queued for upload");
-      } else if (f.endsWith(".m4s")) {
-        // Check if a newer segment exists (meaning this one is finalized)
-        const match = f.match(/seg_(\d+)\.m4s/);
-        if (!match) continue;
-        const num = parseInt(match[1], 10);
-        const nextSeg = `seg_${String(num + 1).padStart(5, "0")}.m4s`;
-        // Upload if next segment exists OR encoding is done (last segment)
-        if (files.includes(nextSeg) || encodingDone) {
-          knownFiles.add(f);
-          uploadedSet.add(f);
-          uploadQueue.push(f);
-          totalSegments++;
-        }
-      }
-    }
-  }, 1000);
-
-  // Start FFmpeg encode
-  const encodePromise = new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     const child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
     child.stderr.on("data", chunk => {
       stderr += chunk.toString();
       if (stderr.length > 8000) stderr = stderr.slice(-8000);
       const m = stderr.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/g);
-      if (m && m.length) {
+      if (m && m.length && duration > 0) {
         const timeStr = m[m.length - 1];
-        if (duration > 0) {
-          const parts = timeStr.replace("time=", "").split(":");
-          const secs = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
-          const pct = Math.min(99, Math.round((secs / duration) * 100));
-          const uploadInfo = uploadedCount > 0 ? ` | ${uploadedCount} segs uploaded` : "";
-          reportStatus("running", `Encoding HLS: ${pct}%${uploadInfo}`, pct);
-        }
+        const parts = timeStr.replace("time=", "").split(":");
+        const secs = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
+        const pct = Math.min(99, Math.round((secs / duration) * 100));
+        reportStatus("running", `Encoding HLS: ${pct}%`, pct);
       }
     });
     child.on("close", code => {
       console.log("");
-      encodingDone = true;
       if (code === 0) {
         try { fs.unlinkSync(INPUT_FILE); } catch (_) {}
         resolve();
@@ -344,53 +263,73 @@ async function encodeAndStreamUpload() {
     child.on("error", reject);
   });
 
-  // Start upload worker in parallel with encoding
-  const uploadPromise = uploadWorker();
+  const files = fs.readdirSync(HLS_DIR);
+  const totalSize = files.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
+  log(`Encode done: ${files.length} files, ${(totalSize / 1024 / 1024).toFixed(1)} MB`);
+  return { files, totalSize, duration };
+}
 
-  // Wait for encoding to finish first
-  await encodePromise;
+// ─── Step 3: Upload HLS files in controlled batches ──────────
+async function uploadHLSFiles(hlsFiles) {
+  const folderId = await createSpaceBytFolder();
+  const fileMap = {};
+  let uploaded = 0;
 
-  // Final watcher pass to catch the last segment(s)
-  if (fs.existsSync(HLS_DIR)) {
-    const files = fs.readdirSync(HLS_DIR);
-    for (const f of files) {
-      if (uploadedSet.has(f) || f === "index.m3u8") continue;
-      if (f === "init.mp4" || f.endsWith(".m4s")) {
-        uploadedSet.add(f);
-        uploadQueue.push(f);
-        totalSegments++;
+  log(`Uploading ${hlsFiles.length} HLS files (${PARALLEL_UPLOADS} parallel)...`);
+  reportStatus("running", `Uploading HLS: 0/${hlsFiles.length}`, 0);
+
+  // Upload manifest last
+  const manifest = hlsFiles.find(f => f === "index.m3u8");
+  const segments = hlsFiles.filter(f => f !== "index.m3u8");
+
+  // Process segments in fixed-size batches
+  for (let i = 0; i < segments.length; i += PARALLEL_UPLOADS) {
+    const batch = segments.slice(i, i + PARALLEL_UPLOADS);
+    const results = await Promise.allSettled(
+      batch.map(async (fileName) => {
+        try {
+          const id = await uploadOneFile(fileName, folderId);
+          fileMap[fileName] = id;
+          return id;
+        } catch (err) {
+          log(`  Retry: ${fileName} (${err.message.slice(0, 80)})`);
+          const id = await uploadOneFile(fileName, folderId);
+          fileMap[fileName] = id;
+          return id;
+        }
+      })
+    );
+
+    // Check for any permanent failures
+    for (let j = 0; j < results.length; j++) {
+      if (results[j].status === "rejected") {
+        throw new Error(`Upload failed: ${batch[j]} — ${results[j].reason?.message}`);
       }
     }
+
+    uploaded += batch.length;
+    const pct = Math.round((uploaded / hlsFiles.length) * 100);
+    if (uploaded % 30 === 0 || i + PARALLEL_UPLOADS >= segments.length) {
+      log(`  Uploaded: ${uploaded}/${hlsFiles.length} (${pct}%)`);
+    }
+    reportStatus("running", `Uploading HLS: ${uploaded}/${hlsFiles.length} (${pct}%)`, pct);
   }
 
-  // Wait for all uploads to finish
-  clearInterval(watchInterval);
-  await uploadPromise;
-
-  // Drain any remaining active uploads
-  if (activeUploads.length > 0) {
-    await Promise.all(activeUploads);
+  // Upload manifest last
+  if (manifest) {
+    log("Uploading final manifest (index.m3u8)...");
+    const manifestId = await uploadOneFile(manifest, folderId);
+    fileMap[manifest] = manifestId;
+    uploaded++;
   }
 
-  // Now upload the final manifest
-  log("Uploading final manifest (index.m3u8)...");
-  reportStatus("running", "Uploading manifest...", 99);
-  const manifestId = await uploadOneFile("index.m3u8", folderId);
-  fileMap["index.m3u8"] = manifestId;
-  uploadedCount++;
+  const manifestFileId = fileMap["index.m3u8"];
+  if (!manifestFileId) throw new Error("Manifest file (index.m3u8) was not uploaded");
 
-  const allFiles = fs.readdirSync(HLS_DIR);
-  const totalSize = allFiles.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
-  log(`HLS encode + upload done: ${allFiles.length} files, ${(totalSize / 1024 / 1024).toFixed(1)} MB, ${uploadedCount} uploaded`);
+  const totalSize = hlsFiles.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
+  log(`Upload done: ${uploaded} files, manifest ID: ${manifestFileId}`);
 
-  return {
-    folderId,
-    manifestFileId: manifestId,
-    fileMap,
-    totalSize,
-    segmentCount: allFiles.length,
-    files: allFiles
-  };
+  return { folderId, manifestFileId, fileMap, totalSize, segmentCount: hlsFiles.length, files: hlsFiles };
 }
 
 // ─── Step 4: Delete old SpaceByte file ───────────────
@@ -449,7 +388,8 @@ async function main() {
   reportStatus("running", "Starting...", 0);
 
   const originalSize = await download();
-  const hlsData = await encodeAndStreamUpload();
+  const { files: hlsFiles } = await encodeHLS();
+  const hlsData = await uploadHLSFiles(hlsFiles);
 
   const reduction = originalSize > 0 ? ((1 - hlsData.totalSize / originalSize) * 100).toFixed(1) : 0;
   log(`Size reduction: ${reduction}% (${(originalSize / 1024 / 1024).toFixed(1)} MB → ${(hlsData.totalSize / 1024 / 1024).toFixed(1)} MB)`);

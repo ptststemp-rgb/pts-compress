@@ -44,6 +44,7 @@ jobs:
 
       - name: Run HLS compression + upload
         env:
+          NODE_OPTIONS: "--max-old-space-size=3072"
           SPACEBYTE_API_TOKEN: ${{ secrets.SPACEBYTE_API_TOKEN }}
           SPACEBYTE_PARENT_FOLDER_ID: ${{ secrets.SPACEBYTE_PARENT_FOLDER_ID }}
           VPS_COMPRESS_SECRET: ${{ secrets.VPS_COMPRESS_SECRET }}
