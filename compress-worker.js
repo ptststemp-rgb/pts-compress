@@ -34,6 +34,7 @@ const FILE_NAME = (process.env.FILE_NAME || "output").replace(/\.mp4$/i, "");
 const CALLBACK_URL = process.env.CALLBACK_URL;
 const GCP_STATUS_URL = process.env.GCP_STATUS_URL || "";
 const PARALLEL_UPLOADS = 6;
+const DOWNLOAD_CHUNKS = 8; // parallel download connections
 
 const SB_API = "https://spacebyte.in/api/v1";
 const TEMP_DIR = "/tmp/compress";
@@ -54,11 +55,7 @@ function reportStatus(status, step, progress) {
 }
 
 // ─── Step 1: Download source video from SpaceByte ────
-async function download() {
-  log(`Downloading SpaceByte file ${SB_FILE_ID}...`);
-  reportStatus("running", "Downloading from SpaceByte...", 0);
-
-  let signedUrl;
+async function getSignedUrl() {
   try {
     const resp = await axios.get(`${SB_API}/file-entries/${SB_FILE_ID}`, {
       headers: { Authorization: `Bearer ${SB_TOKEN}`, Accept: "application/json" },
@@ -71,45 +68,98 @@ async function download() {
     });
 
     if (resp.status === 302 || resp.status === 301) {
-      signedUrl = resp.headers.location;
-    } else {
-      const r2 = await axios.get(`${SB_API}/file-entries/${SB_FILE_ID}`, {
-        headers: { Authorization: `Bearer ${SB_TOKEN}` },
-        maxRedirects: 5,
-        responseType: "stream",
-        timeout: 15000
-      });
-      signedUrl = r2.request?.res?.responseUrl;
-      r2.data?.destroy?.();
+      return resp.headers.location;
     }
+    const r2 = await axios.get(`${SB_API}/file-entries/${SB_FILE_ID}`, {
+      headers: { Authorization: `Bearer ${SB_TOKEN}` },
+      maxRedirects: 5,
+      responseType: "stream",
+      timeout: 15000
+    });
+    const url = r2.request?.res?.responseUrl;
+    r2.data?.destroy?.();
+    return url;
   } catch (err) {
     throw new Error(`Failed to get signed URL: ${err.message}`);
   }
-  if (!signedUrl) throw new Error("No signed URL resolved");
+}
 
-  const resp = await axios.get(signedUrl, {
+async function downloadChunk(url, start, end, partFile) {
+  const resp = await axios.get(url, {
     responseType: "stream",
     timeout: 600000,
-    maxRedirects: 5
+    headers: { Range: `bytes=${start}-${end}` }
   });
-  const writer = fs.createWriteStream(INPUT_FILE);
-  let downloaded = 0;
-  const contentLength = parseInt(resp.headers["content-length"] || "0", 10);
-
-  resp.data.on("data", chunk => {
-    downloaded += chunk.length;
-    if (contentLength > 0 && downloaded % (5 * 1024 * 1024) < chunk.length) {
-      const pct = Math.round((downloaded / contentLength) * 100);
-      reportStatus("running", `Downloading: ${pct}%`, pct);
-    }
-  });
+  const writer = fs.createWriteStream(partFile);
   resp.data.pipe(writer);
-
-  await new Promise((resolve, reject) => {
-    writer.on("finish", resolve);
-    writer.on("error", reject);
-    resp.data.on("error", reject);
+  await new Promise((res, rej) => {
+    writer.on("finish", res);
+    writer.on("error", rej);
+    resp.data.on("error", rej);
   });
+}
+
+async function download() {
+  log(`Downloading SpaceByte file ${SB_FILE_ID}...`);
+  reportStatus("running", "Downloading from SpaceByte...", 0);
+
+  const signedUrl = await getSignedUrl();
+  if (!signedUrl) throw new Error("No signed URL resolved");
+
+  // Get file size with HEAD request
+  const head = await axios.head(signedUrl, { timeout: 15000 });
+  const totalSize = parseInt(head.headers["content-length"] || "0", 10);
+  const acceptRanges = (head.headers["accept-ranges"] || "").toLowerCase();
+
+  // Fall back to single-stream if server doesn't support ranges or file is small
+  if (!totalSize || acceptRanges === "none" || totalSize < 50 * 1024 * 1024) {
+    log("Using single-stream download");
+    const resp = await axios.get(signedUrl, { responseType: "stream", timeout: 600000, maxRedirects: 5 });
+    const writer = fs.createWriteStream(INPUT_FILE);
+    let downloaded = 0;
+    resp.data.on("data", chunk => {
+      downloaded += chunk.length;
+      if (totalSize > 0 && downloaded % (5 * 1024 * 1024) < chunk.length) {
+        const pct = Math.round((downloaded / totalSize) * 100);
+        reportStatus("running", `Downloading: ${pct}%`, pct);
+      }
+    });
+    resp.data.pipe(writer);
+    await new Promise((res, rej) => { writer.on("finish", res); writer.on("error", rej); resp.data.on("error", rej); });
+  } else {
+    // Parallel chunk download
+    const chunks = DOWNLOAD_CHUNKS;
+    const chunkSize = Math.ceil(totalSize / chunks);
+    log(`Parallel download: ${chunks} connections, ${(totalSize / 1024 / 1024).toFixed(0)} MB total`);
+
+    const partFiles = [];
+    const promises = [];
+    for (let i = 0; i < chunks; i++) {
+      const start = i * chunkSize;
+      const end = Math.min(start + chunkSize - 1, totalSize - 1);
+      const partFile = path.join(TEMP_DIR, `part_${i}`);
+      partFiles.push(partFile);
+      promises.push(downloadChunk(signedUrl, start, end, partFile).then(() => {
+        const done = partFiles.filter(f => fs.existsSync(f)).length;
+        const pct = Math.round((done / chunks) * 100);
+        reportStatus("running", `Downloading: ${pct}%`, pct);
+      }));
+    }
+    await Promise.all(promises);
+
+    // Merge chunks into final file
+    const writer = fs.createWriteStream(INPUT_FILE);
+    for (const pf of partFiles) {
+      await new Promise((res, rej) => {
+        const reader = fs.createReadStream(pf);
+        reader.pipe(writer, { end: false });
+        reader.on("end", () => { fs.unlinkSync(pf); res(); });
+        reader.on("error", rej);
+      });
+    }
+    writer.end();
+    await new Promise(res => writer.on("finish", res));
+  }
 
   const size = fs.statSync(INPUT_FILE).size;
   log(`Downloaded: ${(size / 1024 / 1024).toFixed(1)} MB`);
