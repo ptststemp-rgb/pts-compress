@@ -34,7 +34,6 @@ const FILE_NAME = (process.env.FILE_NAME || "output").replace(/\.mp4$/i, "");
 const CALLBACK_URL = process.env.CALLBACK_URL;
 const GCP_STATUS_URL = process.env.GCP_STATUS_URL || "";
 const PARALLEL_UPLOADS = 6;
-const DOWNLOAD_CHUNKS = 8; // parallel download connections
 
 const SB_API = "https://spacebyte.in/api/v1";
 const TEMP_DIR = "/tmp/compress";
@@ -54,7 +53,7 @@ function reportStatus(status, step, progress) {
   }, { timeout: 5000 }).catch(() => {});
 }
 
-// ─── Step 1: Download source video from SpaceByte ────
+// ─── Step 1: Download source video from SpaceByte (aria2c 16 connections) ────
 async function getSignedUrl() {
   try {
     const resp = await axios.get(`${SB_API}/file-entries/${SB_FILE_ID}`, {
@@ -84,21 +83,6 @@ async function getSignedUrl() {
   }
 }
 
-async function downloadChunk(url, start, end, partFile) {
-  const resp = await axios.get(url, {
-    responseType: "stream",
-    timeout: 600000,
-    headers: { Range: `bytes=${start}-${end}` }
-  });
-  const writer = fs.createWriteStream(partFile);
-  resp.data.pipe(writer);
-  await new Promise((res, rej) => {
-    writer.on("finish", res);
-    writer.on("error", rej);
-    resp.data.on("error", rej);
-  });
-}
-
 async function download() {
   log(`Downloading SpaceByte file ${SB_FILE_ID}...`);
   reportStatus("running", "Downloading from SpaceByte...", 0);
@@ -106,71 +90,56 @@ async function download() {
   const signedUrl = await getSignedUrl();
   if (!signedUrl) throw new Error("No signed URL resolved");
 
-  // Start a GET request to discover file size and range support
-  const probe = await axios.get(signedUrl, {
-    responseType: "stream",
-    timeout: 600000,
-    maxRedirects: 5
-  });
-  const totalSize = parseInt(probe.headers["content-length"] || "0", 10);
-  const acceptRanges = (probe.headers["accept-ranges"] || "").toLowerCase();
-  const supportsRanges = acceptRanges !== "none" && acceptRanges !== "";
+  const dir = path.dirname(INPUT_FILE);
+  const out = path.basename(INPUT_FILE);
 
-  // If ranges supported and file is large, abort this stream and do parallel download
-  if (supportsRanges && totalSize > 50 * 1024 * 1024) {
-    probe.data.destroy();
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-x16", "-s16",
+      "--max-connection-per-server=16",
+      "-k1M",
+      "--file-allocation=none",
+      "--auto-file-renaming=false",
+      "--allow-overwrite=true",
+      "--summary-interval=3",
+      "--console-log-level=notice",
+      "--download-result=hide",
+      "-d", dir,
+      "-o", out,
+      signedUrl,
+    ];
 
-    const chunks = DOWNLOAD_CHUNKS;
-    const chunkSize = Math.ceil(totalSize / chunks);
-    log(`Parallel download: ${chunks} connections, ${(totalSize / 1024 / 1024).toFixed(0)} MB total`);
+    const proc = spawn("aria2c", args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stderr = "";
+    const startTime = Date.now();
 
-    const partFiles = [];
-    const promises = [];
-    for (let i = 0; i < chunks; i++) {
-      const start = i * chunkSize;
-      const end = Math.min(start + chunkSize - 1, totalSize - 1);
-      const partFile = path.join(TEMP_DIR, `part_${i}`);
-      partFiles.push(partFile);
-      promises.push(downloadChunk(signedUrl, start, end, partFile).then(() => {
-        const done = partFiles.filter(f => fs.existsSync(f)).length;
-        const pct = Math.round((done / chunks) * 100);
-        reportStatus("running", `Downloading: ${pct}%`, pct);
-      }));
-    }
-    await Promise.all(promises);
-
-    // Merge chunks into final file
-    const writer = fs.createWriteStream(INPUT_FILE);
-    for (const pf of partFiles) {
-      await new Promise((res, rej) => {
-        const reader = fs.createReadStream(pf);
-        reader.pipe(writer, { end: false });
-        reader.on("end", () => { fs.unlinkSync(pf); res(); });
-        reader.on("error", rej);
-      });
-    }
-    writer.end();
-    await new Promise(res => writer.on("finish", res));
-  } else {
-    // Single-stream: continue with the already-opened GET stream
-    log("Using single-stream download");
-    const writer = fs.createWriteStream(INPUT_FILE);
-    let downloaded = 0;
-    probe.data.on("data", chunk => {
-      downloaded += chunk.length;
-      if (totalSize > 0 && downloaded % (5 * 1024 * 1024) < chunk.length) {
-        const pct = Math.round((downloaded / totalSize) * 100);
-        reportStatus("running", `Downloading: ${pct}%`, pct);
+    proc.stdout.on("data", (data) => {
+      const line = data.toString();
+      const dlMatch = line.match(/(\d+(?:\.\d+)?[KMGT]?i?B)\/(\d+(?:\.\d+)?[KMGT]?i?B)\((\d+)%\)/);
+      const speedMatch = line.match(/DL:(\d+(?:\.\d+)?[KMGT]?i?B)/);
+      if (dlMatch) {
+        const pct = parseInt(dlMatch[3], 10);
+        const speedStr = speedMatch ? ` @ ${speedMatch[1]}/s` : "";
+        reportStatus("running", `Downloading: ${dlMatch[3]}%${speedStr}`, pct);
       }
     });
-    probe.data.pipe(writer);
-    await new Promise((res, rej) => { writer.on("finish", res); writer.on("error", rej); probe.data.on("error", rej); });
-  }
 
-  const size = fs.statSync(INPUT_FILE).size;
-  log(`Downloaded: ${(size / 1024 / 1024).toFixed(1)} MB`);
-  reportStatus("running", `Downloaded: ${(size / 1024 / 1024).toFixed(0)} MB`, 100);
-  return size;
+    proc.stderr.on("data", (data) => { stderr += data.toString(); });
+
+    proc.on("close", (code) => {
+      if (code === 0 && fs.existsSync(INPUT_FILE)) {
+        const elapsed = (Date.now() - startTime) / 1000;
+        const size = fs.statSync(INPUT_FILE).size;
+        const speed = size / elapsed;
+        log(`Downloaded: ${(size / 1024 / 1024).toFixed(1)} MB in ${Math.round(elapsed)}s (${(speed / 1024 / 1024).toFixed(1)} MB/s)`);
+        reportStatus("running", `Downloaded: ${(size / 1024 / 1024).toFixed(0)} MB`, 100);
+        resolve(size);
+      } else {
+        reject(new Error(`aria2c exit ${code}: ${stderr.slice(-300)}`));
+      }
+    });
+    proc.on("error", reject);
+  });
 }
 
 // ─── Step 2+3: Encode HLS + stream-upload segments as they're created ──
