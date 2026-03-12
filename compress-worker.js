@@ -33,7 +33,7 @@ const SB_FILE_ID = process.env.SPACEBYTE_FILE_ID;
 const FILE_NAME = (process.env.FILE_NAME || "output").replace(/\.mp4$/i, "");
 const CALLBACK_URL = process.env.CALLBACK_URL;
 const GCP_STATUS_URL = process.env.GCP_STATUS_URL || "";
-const PARALLEL_UPLOADS = 6;
+const PARALLEL_UPLOADS = 15;
 
 const SB_API = "https://spacebyte.in/api/v1";
 const TEMP_DIR = "/tmp/compress";
@@ -184,7 +184,7 @@ async function uploadOneFile(fileName, folderId) {
       headers: { ...form.getHeaders(), Authorization: `Bearer ${SB_TOKEN}` },
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
-      timeout: 300000
+      timeout: 60000
     });
 
     const id = resp.data?.fileEntry?.id || resp.data?.id || resp.data?.data?.id;
@@ -282,38 +282,50 @@ async function uploadHLSFiles(hlsFiles) {
   const manifest = hlsFiles.find(f => f === "index.m3u8");
   const segments = hlsFiles.filter(f => f !== "index.m3u8");
 
-  // Process segments in fixed-size batches
-  for (let i = 0; i < segments.length; i += PARALLEL_UPLOADS) {
-    const batch = segments.slice(i, i + PARALLEL_UPLOADS);
-    const results = await Promise.allSettled(
-      batch.map(async (fileName) => {
+  // Sliding-window concurrency pool — keeps all slots busy
+  const queue = [...segments];
+  const active = new Map(); // promise → fileName
+  const errors = [];
+
+  function launchOne() {
+    if (!queue.length) return;
+    const fileName = queue.shift();
+    const p = (async () => {
+      try {
+        const id = await uploadOneFile(fileName, folderId);
+        fileMap[fileName] = id;
+      } catch (err) {
+        log(`  Retry: ${fileName} (${err.message.slice(0, 80)})`);
         try {
           const id = await uploadOneFile(fileName, folderId);
           fileMap[fileName] = id;
-          return id;
-        } catch (err) {
-          log(`  Retry: ${fileName} (${err.message.slice(0, 80)})`);
-          const id = await uploadOneFile(fileName, folderId);
-          fileMap[fileName] = id;
-          return id;
+        } catch (err2) {
+          errors.push(`${fileName}: ${err2.message}`);
         }
-      })
-    );
-
-    // Check for any permanent failures
-    for (let j = 0; j < results.length; j++) {
-      if (results[j].status === "rejected") {
-        throw new Error(`Upload failed: ${batch[j]} — ${results[j].reason?.message}`);
       }
-    }
-
-    uploaded += batch.length;
-    const pct = Math.round((uploaded / hlsFiles.length) * 100);
-    if (uploaded % 30 === 0 || i + PARALLEL_UPLOADS >= segments.length) {
-      log(`  Uploaded: ${uploaded}/${hlsFiles.length} (${pct}%)`);
-    }
-    reportStatus("running", `Uploading HLS: ${uploaded}/${hlsFiles.length} (${pct}%)`, pct);
+      uploaded++;
+      const pct = Math.round((uploaded / hlsFiles.length) * 100);
+      if (uploaded % 30 === 0) {
+        log(`  Uploaded: ${uploaded}/${hlsFiles.length} (${pct}%)`);
+      }
+      reportStatus("running", `Uploading HLS: ${uploaded}/${hlsFiles.length} (${pct}%)`, pct);
+    })();
+    active.set(p, fileName);
+    p.finally(() => active.delete(p));
+    return p;
   }
+
+  // Fill initial pool
+  while (active.size < PARALLEL_UPLOADS && queue.length) launchOne();
+
+  // As each completes, launch the next
+  while (active.size > 0) {
+    await Promise.race([...active.keys()]);
+    while (active.size < PARALLEL_UPLOADS && queue.length) launchOne();
+  }
+
+  if (errors.length) throw new Error(`Upload failed for ${errors.length} file(s): ${errors[0]}`);
+  log(`  Uploaded: ${uploaded}/${hlsFiles.length} (segments done)`);
 
   // Upload manifest last
   if (manifest) {
