@@ -1,0 +1,52 @@
+name: HLS Compress Video 540p
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_id:
+        description: "Media ID (e.g. sb_3100156)"
+        required: true
+      spacebyte_file_id:
+        description: "SpaceByte file entry ID"
+        required: true
+      file_name:
+        description: "Base name for HLS folder"
+        required: true
+      callback_url:
+        description: "Oracle VPS callback URL"
+        required: true
+      gcp_status_url:
+        description: "GCP dashboard status callback URL"
+        required: false
+        default: ""
+
+jobs:
+  compress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Verify FFmpeg
+        run: ffmpeg -version | head -1
+
+      - name: Run HLS compression + upload
+        env:
+          SPACEBYTE_API_TOKEN: ${{ secrets.SPACEBYTE_API_TOKEN }}
+          SPACEBYTE_PARENT_FOLDER_ID: ${{ secrets.SPACEBYTE_PARENT_FOLDER_ID }}
+          VPS_COMPRESS_SECRET: ${{ secrets.VPS_COMPRESS_SECRET }}
+          MEDIA_ID: ${{ inputs.media_id }}
+          SPACEBYTE_FILE_ID: ${{ inputs.spacebyte_file_id }}
+          FILE_NAME: ${{ inputs.file_name }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          GCP_STATUS_URL: ${{ inputs.gcp_status_url }}
+        run: node compress-worker.js

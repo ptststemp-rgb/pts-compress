@@ -1,0 +1,13 @@
+{
+  "name": "pts-compress",
+  "version": "1.0.0",
+  "description": "PTS Library - HLS video compression worker for GitHub Actions",
+  "private": false,
+  "scripts": {
+    "compress": "node compress-worker.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "form-data": "^4.0.0"
+  }
+}
