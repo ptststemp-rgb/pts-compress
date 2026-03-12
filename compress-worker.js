@@ -360,7 +360,8 @@ async function callback(hlsData) {
       folderId: hlsData.folderId,
       manifestFileId: hlsData.manifestFileId,
       segmentCount: hlsData.segmentCount,
-      totalSize: hlsData.totalSize
+      totalSize: hlsData.totalSize,
+      fileMap: hlsData.fileMap
     },
     secret: SECRET
   }, {
