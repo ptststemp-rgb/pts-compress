@@ -106,28 +106,20 @@ async function download() {
   const signedUrl = await getSignedUrl();
   if (!signedUrl) throw new Error("No signed URL resolved");
 
-  // Get file size with HEAD request
-  const head = await axios.head(signedUrl, { timeout: 15000 });
-  const totalSize = parseInt(head.headers["content-length"] || "0", 10);
-  const acceptRanges = (head.headers["accept-ranges"] || "").toLowerCase();
+  // Start a GET request to discover file size and range support
+  const probe = await axios.get(signedUrl, {
+    responseType: "stream",
+    timeout: 600000,
+    maxRedirects: 5
+  });
+  const totalSize = parseInt(probe.headers["content-length"] || "0", 10);
+  const acceptRanges = (probe.headers["accept-ranges"] || "").toLowerCase();
+  const supportsRanges = acceptRanges !== "none" && acceptRanges !== "";
 
-  // Fall back to single-stream if server doesn't support ranges or file is small
-  if (!totalSize || acceptRanges === "none" || totalSize < 50 * 1024 * 1024) {
-    log("Using single-stream download");
-    const resp = await axios.get(signedUrl, { responseType: "stream", timeout: 600000, maxRedirects: 5 });
-    const writer = fs.createWriteStream(INPUT_FILE);
-    let downloaded = 0;
-    resp.data.on("data", chunk => {
-      downloaded += chunk.length;
-      if (totalSize > 0 && downloaded % (5 * 1024 * 1024) < chunk.length) {
-        const pct = Math.round((downloaded / totalSize) * 100);
-        reportStatus("running", `Downloading: ${pct}%`, pct);
-      }
-    });
-    resp.data.pipe(writer);
-    await new Promise((res, rej) => { writer.on("finish", res); writer.on("error", rej); resp.data.on("error", rej); });
-  } else {
-    // Parallel chunk download
+  // If ranges supported and file is large, abort this stream and do parallel download
+  if (supportsRanges && totalSize > 50 * 1024 * 1024) {
+    probe.data.destroy();
+
     const chunks = DOWNLOAD_CHUNKS;
     const chunkSize = Math.ceil(totalSize / chunks);
     log(`Parallel download: ${chunks} connections, ${(totalSize / 1024 / 1024).toFixed(0)} MB total`);
@@ -159,6 +151,20 @@ async function download() {
     }
     writer.end();
     await new Promise(res => writer.on("finish", res));
+  } else {
+    // Single-stream: continue with the already-opened GET stream
+    log("Using single-stream download");
+    const writer = fs.createWriteStream(INPUT_FILE);
+    let downloaded = 0;
+    probe.data.on("data", chunk => {
+      downloaded += chunk.length;
+      if (totalSize > 0 && downloaded % (5 * 1024 * 1024) < chunk.length) {
+        const pct = Math.round((downloaded / totalSize) * 100);
+        reportStatus("running", `Downloading: ${pct}%`, pct);
+      }
+    });
+    probe.data.pipe(writer);
+    await new Promise((res, rej) => { writer.on("finish", res); writer.on("error", rej); probe.data.on("error", rej); });
   }
 
   const size = fs.statSync(INPUT_FILE).size;
