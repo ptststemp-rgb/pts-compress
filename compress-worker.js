@@ -33,7 +33,7 @@ const SB_FILE_ID = process.env.SPACEBYTE_FILE_ID;
 const FILE_NAME = (process.env.FILE_NAME || "output").replace(/\.mp4$/i, "");
 const CALLBACK_URL = process.env.CALLBACK_URL;
 const GCP_STATUS_URL = process.env.GCP_STATUS_URL || "";
-const PARALLEL_UPLOADS = 15;
+const PARALLEL_UPLOADS = 10;
 
 const SB_API = "https://spacebyte.in/api/v1";
 const TEMP_DIR = "/tmp/compress";
@@ -53,33 +53,45 @@ function reportStatus(status, step, progress) {
   }, { timeout: 5000 }).catch(() => {});
 }
 
+// ─── Helpers ─────────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 // ─── Step 1: Download source video from SpaceByte (aria2c 16 connections) ────
 async function getSignedUrl() {
-  try {
-    const resp = await axios.get(`${SB_API}/file-entries/${SB_FILE_ID}`, {
-      headers: { Authorization: `Bearer ${SB_TOKEN}`, Accept: "application/json" },
-      maxRedirects: 0,
-      validateStatus: s => s >= 200 && s < 400,
-      timeout: 15000
-    }).catch(err => {
-      if (err.response && err.response.status === 302) return err.response;
-      throw err;
-    });
+  const maxRetries = 5;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const resp = await axios.get(`${SB_API}/file-entries/${SB_FILE_ID}`, {
+        headers: { Authorization: `Bearer ${SB_TOKEN}`, Accept: "application/json" },
+        maxRedirects: 0,
+        validateStatus: s => s >= 200 && s < 400,
+        timeout: 30000
+      }).catch(err => {
+        if (err.response && err.response.status === 302) return err.response;
+        throw err;
+      });
 
-    if (resp.status === 302 || resp.status === 301) {
-      return resp.headers.location;
+      if (resp.status === 302 || resp.status === 301) {
+        return resp.headers.location;
+      }
+      const r2 = await axios.get(`${SB_API}/file-entries/${SB_FILE_ID}`, {
+        headers: { Authorization: `Bearer ${SB_TOKEN}` },
+        maxRedirects: 5,
+        responseType: "stream",
+        timeout: 30000
+      });
+      const url = r2.request?.res?.responseUrl;
+      r2.data?.destroy?.();
+      return url;
+    } catch (err) {
+      if (attempt < maxRetries) {
+        const delay = Math.min(5000 * Math.pow(2, attempt - 1), 30000);
+        log(`getSignedUrl attempt ${attempt} failed: ${err.message}. Retrying in ${delay / 1000}s...`);
+        await sleep(delay);
+      } else {
+        throw new Error(`Failed to get signed URL after ${maxRetries} attempts: ${err.message}`);
+      }
     }
-    const r2 = await axios.get(`${SB_API}/file-entries/${SB_FILE_ID}`, {
-      headers: { Authorization: `Bearer ${SB_TOKEN}` },
-      maxRedirects: 5,
-      responseType: "stream",
-      timeout: 15000
-    });
-    const url = r2.request?.res?.responseUrl;
-    r2.data?.destroy?.();
-    return url;
-  } catch (err) {
-    throw new Error(`Failed to get signed URL: ${err.message}`);
   }
 }
 
@@ -170,29 +182,32 @@ async function uploadOneFile(fileName, folderId) {
     : fileName.endsWith(".mp4") ? "video/mp4"
     : "video/iso.segment";
 
-  const form = new FormData();
-  const stream = fs.createReadStream(filePath);
-  form.append("file", stream, {
-    filename: fileName,
-    contentType,
-    knownLength: fileSize
-  });
-  form.append("parentId", String(folderId));
-
-  try {
-    const resp = await axios.post(`${SB_API}/uploads`, form, {
-      headers: { ...form.getHeaders(), Authorization: `Bearer ${SB_TOKEN}` },
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      timeout: 60000
+  async function doUpload() {
+    const form = new FormData();
+    const stream = fs.createReadStream(filePath);
+    form.append("file", stream, {
+      filename: fileName,
+      contentType,
+      knownLength: fileSize
     });
+    form.append("parentId", String(folderId));
 
-    const id = resp.data?.fileEntry?.id || resp.data?.id || resp.data?.data?.id;
-    if (!id) throw new Error(`Upload ${fileName} failed: no ID returned`);
-    return String(id);
-  } finally {
-    stream.destroy();
+    try {
+      const resp = await axios.post(`${SB_API}/uploads`, form, {
+        headers: { ...form.getHeaders(), Authorization: `Bearer ${SB_TOKEN}` },
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        timeout: 90000
+      });
+
+      const id = resp.data?.fileEntry?.id || resp.data?.id || resp.data?.data?.id;
+      if (!id) throw new Error(`Upload ${fileName} failed: no ID returned`);
+      return String(id);
+    } finally {
+      stream.destroy();
+    }
   }
+  return doUpload();
 }
 
 // ─── Step 3: Encode HLS ──────────────────────────────────────
@@ -291,18 +306,24 @@ async function uploadHLSFiles(hlsFiles) {
     if (!queue.length) return;
     const fileName = queue.shift();
     const p = (async () => {
-      try {
-        const id = await uploadOneFile(fileName, folderId);
-        fileMap[fileName] = id;
-      } catch (err) {
-        log(`  Retry: ${fileName} (${err.message.slice(0, 80)})`);
+      const maxRetries = 4;
+      let lastErr;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           const id = await uploadOneFile(fileName, folderId);
           fileMap[fileName] = id;
-        } catch (err2) {
-          errors.push(`${fileName}: ${err2.message}`);
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (attempt < maxRetries) {
+            const delay = Math.min(3000 * Math.pow(2, attempt - 1), 20000);
+            log(`  Retry ${attempt}/${maxRetries}: ${fileName} (${err.message.slice(0, 60)}). Wait ${delay / 1000}s`);
+            await sleep(delay);
+          }
         }
       }
+      if (lastErr) errors.push(`${fileName}: ${lastErr.message}`);
       uploaded++;
       const pct = Math.round((uploaded / hlsFiles.length) * 100);
       if (uploaded % 30 === 0) {
