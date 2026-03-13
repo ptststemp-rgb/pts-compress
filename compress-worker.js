@@ -401,7 +401,17 @@ async function main() {
   reportStatus("running", "Starting...", 0);
 
   const originalSize = await download();
-  const { files: hlsFiles } = await encodeHLS();
+  const { files: hlsFiles, totalSize: hlsTotalSize } = await encodeHLS();
+
+  // Skip if HLS output is larger than original (e.g. HEVC→H.264 at same resolution)
+  if (hlsTotalSize >= originalSize) {
+    log(`Skipped: HLS output (${(hlsTotalSize / 1024 / 1024).toFixed(1)} MB) >= original (${(originalSize / 1024 / 1024).toFixed(1)} MB). Keeping original.`);
+    try { fs.rmSync(HLS_DIR, { recursive: true, force: true }); } catch (_) {}
+    reportStatus("completed", "Skipped (output >= original)", 100);
+    log("=== Skipped — original smaller ===");
+    process.exit(0);
+  }
+
   const hlsData = await uploadHLSFiles(hlsFiles);
 
   const reduction = originalSize > 0 ? ((1 - hlsData.totalSize / originalSize) * 100).toFixed(1) : 0;
