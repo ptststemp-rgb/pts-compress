@@ -1,24 +1,32 @@
-name: HLS Compress Video 540p
+name: Compress Video 480p
 
 on:
   workflow_dispatch:
     inputs:
-      media_id:
-        description: "Media ID (e.g. sb_3100156)"
+      job_id:
+        description: "Job queue ID"
         required: true
-      spacebyte_file_id:
-        description: "SpaceByte file entry ID"
+      media_id:
+        description: "Media ID in database"
         required: true
       file_name:
-        description: "Base name for HLS folder"
+        description: "Base name for output file"
+        required: true
+      source_url:
+        description: "Direct download URL for source video"
         required: true
       callback_url:
-        description: "Oracle VPS callback URL"
+        description: "VPS callback URL for completion"
         required: true
-      gcp_status_url:
-        description: "GCP dashboard status callback URL"
+      progress_url:
+        description: "VPS progress URL for real-time updates"
+        required: true
+      category:
+        description: "Content category: movie or series"
+        required: true
+      language:
+        description: "Audio language to select (e.g. Hindi, English, Telugu)"
         required: false
-        default: ""
 
 jobs:
   compress:
@@ -27,30 +35,36 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/compress-worker.js
+          sparse-checkout-cone-mode: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install FFmpeg + aria2
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg aria2
-
       - name: Install dependencies
-        run: npm install
+        run: |
+          npm install axios
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg libx265-dev
 
       - name: Verify FFmpeg
-        run: ffmpeg -version | head -1
+        run: |
+          which ffmpeg
+          ffmpeg -version | head -1
+          ffmpeg -encoders 2>/dev/null | grep libx265 || echo 'WARNING: libx265 not found'
 
-      - name: Run HLS compression + upload
+      - name: Run compression + upload
         env:
-          NODE_OPTIONS: "--max-old-space-size=3072"
-          SPACEBYTE_API_TOKEN: ${{ secrets.SPACEBYTE_API_TOKEN }}
-          SPACEBYTE_PARENT_FOLDER_ID: ${{ secrets.SPACEBYTE_PARENT_FOLDER_ID }}
           VPS_COMPRESS_SECRET: ${{ secrets.VPS_COMPRESS_SECRET }}
+          UPLOAD_URL: ${{ secrets.UPLOAD_URL }}
+          JOB_ID: ${{ inputs.job_id }}
           MEDIA_ID: ${{ inputs.media_id }}
-          SPACEBYTE_FILE_ID: ${{ inputs.spacebyte_file_id }}
           FILE_NAME: ${{ inputs.file_name }}
+          SOURCE_URL: ${{ inputs.source_url }}
           CALLBACK_URL: ${{ inputs.callback_url }}
-          GCP_STATUS_URL: ${{ inputs.gcp_status_url }}
-        run: node compress-worker.js
+          PROGRESS_URL: ${{ inputs.progress_url }}
+          AUDIO_LANGUAGE: ${{ inputs.language }}
+        run: node scripts/compress-worker.js
